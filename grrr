@@ -1,0 +1,1365 @@
+#!/usr/bin/env perl
+
+# ============================================================
+# grrr - General Record Replay & Report test utility
+#
+# Record the behaviour of shell commands (exit status, stdout,
+# stderr, raw bytes) into a binary snapshot, then Replay the
+# commands later and Report anything that changed.
+#
+# Single file, core Perl only, i.e., whatever comes shipped
+# with your OS.
+#
+# ./grrr help
+# ============================================================
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptionsFromArray);
+use File::Spec;
+use IO::Select;
+use POSIX       ();
+use Time::HiRes qw(time);
+
+# ============================================================
+# 1. VERSION AND CONSTANTS
+# ============================================================
+
+our $VERSION = '1.0.0';
+
+use constant {
+    EXIT_SUCCESS => 0,
+    EXIT_FAILURE => 1,       # a test failed / has no snapshot
+    EXIT_ERROR   => 2,       # usage error, unreadable file, corrupt snapshot...
+    MAGIC        => 'GRRR',  # snapshot recordfile id
+};
+
+$| = 1;                      # autoflush (for pipe and socket write)
+
+# ============================================================
+# 2. USER INTERFACE / HELP
+# ============================================================
+
+sub usage {
+    return <<'EOT';
+usage: grrr [options] <command> [pattern]
+
+commands:
+  record [pattern]   run the tests and store their results in the snapshot
+                     (with a pattern: re-record only the matching tests)
+  replay [pattern]   run the tests and compare against the snapshot
+  inspect [pattern]  list what is stored in the snapshot (--show: dump data)
+  selftest           run grrr's own test suite
+  help | version
+
+options:
+  -f, --file FILE        test list            (default: tests.list)
+  -s, --snapshot FILE    snapshot file        (default: <FILE>.bi)
+  -t, --timeout SECS     per-test timeout     (default: 10)
+  -n, --normalize LIST   comma separated normalizers applied at replay time
+  -p, --plugin FILE      load extra normalizers from FILE (repeatable)
+  -q, --quiet            do not list passing tests
+      --show             inspect: dump stdout/stderr
+  -h, --help / -V, --version
+
+pattern is a Perl regex matched against the test id.
+
+tests.list format (one shell command per line):
+  # comment
+  @name   friendly id          (optional; default id is the command itself)
+  @stdin  path/to/file         (optional; default is /dev/null)
+  @timeout 2.5                 (optional; seconds)
+  @normalize crlf,timestamp    (optional; see below)
+  HW_BACKEND=mock ./build/app --self-check
+
+Directives apply to the next command line. Commands run through
+/bin/sh -c in the current directory, so environment variables, pipes
+and redirections work. Use env vars in the command to switch your
+application between its release/mock/test back-ends.
+
+normalizers (applied to stdout and stderr of BOTH sides at replay):
+  crlf          CRLF -> LF
+  trailing-ws   strip trailing blanks on every line
+  timestamp     2026-11-06T10:11:12Z style stamps -> <TIMESTAMP>
+  address       0xdeadbeef style addresses (6+ hex digits) -> 0xADDR
+
+plugins (--plugin FILE): the file returns a hash reference of
+name => closure. Each closure is a pure function, bytes in, bytes out:
+
+  # grrr.plugins.pl
+  return {
+      'strip-ansi' => sub { (my $s = $_[0]) =~ s/\e\[[0-9;]*m//g; $s },
+  };
+
+Plugin names can then be used in @normalize and --normalize. A plugin
+may not redefine an existing name. Pass --plugin on every grrr call that
+reads a list using them (record included, since the list is validated).
+
+exit status: 0 all good, 1 mismatch or unrecorded test, 2 error
+EOT
+}
+
+sub print_help    { print usage();           return EXIT_SUCCESS }
+sub print_version { print "grrr $VERSION\n"; return EXIT_SUCCESS }
+
+# ============================================================
+# 3. FUNCTIONAL UTILITIES
+# ============================================================
+
+sub foldl {
+    my ( $fn, $acc, $items ) = @_;
+    $acc = $fn->( $acc, $_ ) for @$items;
+    return $acc;
+}
+
+sub foldr {
+    my ( $fn, $acc, $items ) = @_;
+    $acc = $fn->( $_, $acc ) for reverse @$items;
+    return $acc;
+}
+
+# compose(f, g, h)->(x) == h(g(f(x))) (left to right)
+sub identity { return $_[0] }
+
+# identity is the unit of composition: compose() of nothing is identity,
+# and each step wraps the previous result in one more closure.
+sub compose {
+    my (@fns) = @_;
+    return foldl(
+        sub {
+            my ( $acc, $f ) = @_;
+            return sub { $f->( $acc->( $_[0] ) ) };
+        },
+        \&identity,
+        \@fns
+    );
+}
+
+# ============================================================
+# 4. DEFAULT STRATEGIES (CLOSURES)
+# ============================================================
+
+# Normalizers: bytes -> bytes. Add your own here. or better yet, use the plugins
+my %NORMALIZERS = (
+    'crlf' => sub {
+        ( my $s = $_[0] ) =~ s/\r\n/\n/g;
+        return $s;
+    },
+    'trailing-ws' => sub {
+        ( my $s = $_[0] ) =~ s/[ \t]+$//mg;
+        return $s;
+    },
+    'timestamp' => sub {
+        ( my $s = $_[0] ) =~
+s/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/<TIMESTAMP>/g;
+        return $s;
+    },
+    'address' => sub {
+        ( my $s = $_[0] ) =~ s/\b0x[0-9a-fA-F]{6,}\b/0xADDR/g;
+        return $s;
+    },
+);
+
+# The default comparison: which fields differ (strict byte equality).
+my $strict_compare = sub {
+    my ( $want, $got ) = @_;
+    return grep { $want->{$_} ne $got->{$_} } qw(status stdout stderr);
+};
+
+# Runner factory: closes over the default timeout and the raw runner.
+# The raw runner is injected, so tests can pass a fake one.
+sub make_runner {
+    my ( $run, $default_timeout ) = @_;
+    return sub {
+        my ($test) = @_;
+        return $run->( $test, $test->{timeout} // $default_timeout );
+    };
+}
+
+# ---- plugins: extend the normalizer registry at runtime ---------------
+#
+# A plugin file returns a hash reference { name => sub { bytes -> bytes } }.
+# load_plugins() folds the files over a registry and returns a NEW registry;
+# the built-in %NORMALIZERS is never modified.
+
+sub load_plugin_file {
+    my ($path) = @_;
+    my $abs =
+      File::Spec->rel2abs($path);    # `do` would search @INC for a bare name
+    -f $abs or die "plugin '$path': no such file\n";
+
+    local $@;
+    my $ret = do $abs;
+    die "plugin '$path': $@" if $@;
+    die "plugin '$path' must return a hash reference (name => sub)\n"
+      unless ref($ret) eq 'HASH';
+    return $ret;
+}
+
+# A normalizer must be a pure bytes -> bytes function. We can't prove it,
+# but we can reject the common mistakes: wrong type, dying, non-string
+# results, and results that change between two identical calls.
+sub validate_plugin {
+    my ( $path, $name, $fn ) = @_;
+    die
+"plugin '$path': bad normalizer name '$name' (use letters, digits, _ and -)\n"
+      unless $name =~ /\A[\w-]+\z/;
+    die "plugin '$path': '$name' is not a code reference\n"
+      unless ref($fn) eq 'CODE';
+
+    my $probe = "probe 2026-11-06T10:11:12Z pid=42 0xdeadbeef\r\n\0\xff end";
+    my ( $r1, $r2 ) = eval { ( $fn->($probe), $fn->($probe) ) };
+    die "plugin '$path': '$name' died on probe input: $@" if $@;
+    die "plugin '$path': '$name' must return a plain string\n"
+      if !defined $r1 || !defined $r2 || ref $r1 || ref $r2;
+    die "plugin '$path': '$name' is not pure (same input, different output)\n"
+      if $r1 ne $r2;
+    return 1;
+}
+
+sub load_plugins {
+    my ( $base, @paths ) = @_;
+    return foldl(
+        sub {
+            my ( $registry, $path ) = @_;
+            my $plugin = load_plugin_file($path);
+            my %added;
+            for my $name ( sort keys %$plugin ) {
+                validate_plugin( $path, $name, $plugin->{$name} );
+                die "plugin '$path': normalizer '$name' is already defined\n"
+                  if exists $registry->{$name};
+                $added{$name} = $plugin->{$name};
+            }
+            return { %$registry, %added };
+        },
+        $base,
+        \@paths
+    );
+}
+
+# ============================================================
+# 5. INPUT PIPELINE
+# ============================================================
+
+sub slurp {
+    my ($path) = @_;
+    open( my $fh, '<:raw', $path ) or die "cannot read $path: $!\n";
+    local $/;
+    my $data = <$fh>;
+    close $fh;
+    return $data // '';
+}
+
+sub spew_atomic {
+    my ( $path, $bytes ) = @_;
+    my $tmp = "$path.tmp.$$";
+    open( my $fh, '>:raw', $tmp ) or die "cannot write $tmp: $!\n";
+    print {$fh} $bytes            or die "write error on $tmp: $!\n";
+    close $fh                     or die "close error on $tmp: $!\n";
+    rename $tmp, $path or die "cannot rename $tmp to $path: $!\n";
+    return 1;
+}
+
+# PURE: text of tests.list -> [ { id cmd stdin timeout normalize line } ]
+sub parse_tests {
+    my ( $text, $registry ) = @_;
+    $registry //= \%NORMALIZERS;
+    my ( @tests, %seen, %pending );
+    my $lineno = 0;
+
+    for my $line ( split /\n/, $text ) {
+        $lineno++;
+        $line =~ s/\r\z//;
+        next if $line =~ /\A\s*(?:#.*)?\z/;
+
+        if ( $line =~ /\A\s*\@(\w+)(?:\s+(.*?))?\s*\z/ ) {
+            my ( $key, $val ) = ( $1, $2 // '' );
+            die "line $lineno: \@$key needs a value\n" unless length $val;
+
+            if ( $key eq 'name' || $key eq 'stdin' ) {
+
+                # plain string
+            }
+            elsif ( $key eq 'timeout' ) {
+                die "line $lineno: bad timeout '$val'\n"
+                  unless $val =~ /\A\d+(?:\.\d+)?\z/ && $val > 0;
+            }
+            elsif ( $key eq 'normalize' ) {
+                my @names = split /\s*,\s*/, $val;
+                my @bad   = grep { !$registry->{$_} } @names;
+                die "line $lineno: unknown normalizer(s): "
+                  . join( ', ', @bad ) . "\n"
+                  if @bad;
+                $val = \@names;
+            }
+            else {
+                die "line $lineno: unknown directive \@$key\n";
+            }
+            $pending{$key} = $val;
+            next;
+        }
+
+        ( my $cmd = $line ) =~ s/\A\s+|\s+\z//g;
+        my $id = $pending{name} // $cmd;
+        die "line $lineno: duplicate test '$id'\n" if $seen{$id}++;
+
+        push @tests,
+          {
+            id        => $id,
+            cmd       => $cmd,
+            stdin     => $pending{stdin},
+            timeout   => $pending{timeout},
+            normalize => $pending{normalize} // [],
+            line      => $lineno,
+          };
+        %pending = ();
+    }
+
+    die "dangling directive(s) at end of file: "
+      . join( ', ', map { "\@$_" } sort keys %pending ) . "\n"
+      if %pending;
+
+    return \@tests;
+}
+
+sub filter_by_id {
+    my ( $items, $pattern ) = @_;
+    return @$items unless defined $pattern;
+    my $re = eval { qr/$pattern/ } or die "bad pattern '$pattern': $@";
+    return grep { $_->{id} =~ $re } @$items;
+}
+
+sub select_tests {
+    my ( $tests, $pattern ) = @_;
+    my @selected = filter_by_id( $tests, $pattern );
+    die "no test matches '$pattern'\n" unless @selected;
+    return @selected;
+}
+
+sub load_tests {
+    my ( $io, $o ) = @_;
+    my $tests = parse_tests( $io->{slurp}->( $o->{file} ), $o->{registry} );
+    die "no tests found in $o->{file}\n" unless @$tests;
+    return $tests;
+}
+
+# ============================================================
+# 6. EXECUTION PIPELINE (impure: processes)
+# ============================================================
+
+my $running_pid;    # for signal handler cleanup
+
+sub kill_tree {
+    my ($pid) = @_;
+
+    # negative signal name => signal the whole process group
+    kill( '-KILL', $pid ) or kill( 'KILL', $pid );
+}
+
+# Run one test. Returns { id status stdout stderr timed_out }.
+# stdin is /dev/null (or the @stdin file). stdout and stderr are read
+# concurrently with select() so a chatty child can never deadlock us.
+sub run_command {
+    my ( $test, $timeout ) = @_;
+
+    if ( defined $test->{stdin} && !-r $test->{stdin} ) {
+        die "test '$test->{id}': cannot read stdin file '$test->{stdin}'\n";
+    }
+
+    pipe( my $out_r, my $out_w ) or die "pipe: $!\n";
+    pipe( my $err_r, my $err_w ) or die "pipe: $!\n";
+
+    my $pid = fork;
+    die "fork: $!\n" unless defined $pid;
+
+    if ( $pid == 0 ) {
+        setpgrp( 0, 0 )
+          ;    # own process group, so a timeout can kill the whole tree
+        close $out_r;
+        close $err_r;
+        my $in = defined $test->{stdin} ? $test->{stdin} : '/dev/null';
+        open( STDIN,  '<',  $in )    or POSIX::_exit(126);
+        open( STDOUT, '>&', $out_w ) or POSIX::_exit(126);
+        open( STDERR, '>&', $err_w ) or POSIX::_exit(126);
+        exec( '/bin/sh', '-c', $test->{cmd} ) or POSIX::_exit(127);
+    }
+
+    $running_pid = $pid;
+    close $out_w;
+    close $err_w;
+    setpgrp( $pid, $pid );    # avoid the fork/exec race; failure is harmless
+
+    binmode $_ for $out_r, $err_r;
+    my %buf       = ( out            => '',    err            => '' );
+    my %name      = ( fileno($out_r) => 'out', fileno($err_r) => 'err' );
+    my $sel       = IO::Select->new( $out_r, $err_r );
+    my $deadline  = time + $timeout;
+    my $timed_out = 0;
+
+    while ( $sel->count ) {
+        my $left = $deadline - time;
+        if ( $left <= 0 ) {
+            $timed_out = 1;
+            kill_tree($pid);
+            last;
+        }
+        for my $fh ( $sel->can_read($left) ) {
+            my $n = sysread( $fh, my $chunk, 65536 );
+            if ( !defined $n ) {
+                next if $!{EINTR};
+                $sel->remove($fh);
+                next;
+            }
+            if ( $n == 0 ) { $sel->remove($fh); next }
+            $buf{ $name{ fileno $fh } } .= $chunk;
+        }
+    }
+
+    close $out_r;
+    close $err_r;
+    waitpid( $pid, 0 );
+    my $status = $?;
+    $running_pid = undef;
+
+    return {
+        id        => $test->{id},
+        status    => $status,
+        stdout    => $buf{out},
+        stderr    => $buf{err},
+        timed_out => $timed_out,
+    };
+}
+
+# ============================================================
+# 7. TRANSFORMATION PIPELINE (pure)
+# ============================================================
+
+sub normalize_record {
+    my ( $names, $record, $registry ) = @_;
+    $registry //= \%NORMALIZERS;
+    my $f = compose( map { $registry->{$_} } @$names );
+    return {
+        %$record,
+        stdout => $f->( $record->{stdout} ),
+        stderr => $f->( $record->{stderr} )
+    };
+}
+
+# Replace the old records of re-recorded tests, keep the others, and
+# drop records whose test no longer exists. Order follows the test list.
+sub merge_snapshot {
+    my ( $tests, $old, $fresh ) = @_;
+    my %o = map { ( $_->{id}, $_ ) } @$old;
+    my %f = map { ( $_->{id}, $_ ) } @$fresh;
+    return [ map { $f{ $_->{id} } // $o{ $_->{id} } // () } @$tests ];
+}
+
+# ============================================================
+# 8. SERIALIZATION PIPELINE (pure)
+#
+# snapshot := "GRRR" count:u32be record*
+# record := id:chunk status:i32be stdout:chunk stderr:chunk
+# chunk := length:u32be bytes
+# ============================================================
+
+sub chunk { return pack( 'N', length( $_[0] ) ) . $_[0] }
+
+sub encode_record {
+    my ($r) = @_;
+    return
+        chunk( $r->{id} )
+      . pack( 'l>', $r->{status} )
+      . chunk( $r->{stdout} )
+      . chunk( $r->{stderr} );
+}
+
+sub serialize_results {
+    my ($records) = @_;
+    return
+        MAGIC
+      . pack( 'N', scalar @$records )
+      . join( '', map { encode_record($_) } @$records );
+}
+
+sub take_chunk {
+    my ( $bytes, $off ) = @_;
+    die "corrupt snapshot (truncated)\n" if $off + 4 > length $bytes;
+    my $len = unpack( 'N', substr( $bytes, $off, 4 ) );
+    $off += 4;
+    die "corrupt snapshot (truncated)\n" if $off + $len > length $bytes;
+    return ( substr( $bytes, $off, $len ), $off + $len );
+}
+
+sub take_status {
+    my ( $bytes, $off ) = @_;
+    die "corrupt snapshot (truncated)\n" if $off + 4 > length $bytes;
+    return ( unpack( 'l>', substr( $bytes, $off, 4 ) ), $off + 4 );
+}
+
+sub deserialize_results {
+    my ($bytes) = @_;
+    die "not a grrr snapshot\n"
+      unless length($bytes) >= 8 && substr( $bytes, 0, 4 ) eq MAGIC;
+
+    my $count = unpack( 'N', substr( $bytes, 4, 4 ) );
+    my $off   = 8;
+    my @records;
+
+    for ( 1 .. $count ) {
+        my ( $id, $status, $stdout, $stderr );
+        ( $id, $off )     = take_chunk( $bytes, $off );
+        ( $status, $off ) = take_status( $bytes, $off );
+        ( $stdout, $off ) = take_chunk( $bytes, $off );
+        ( $stderr, $off ) = take_chunk( $bytes, $off );
+        push @records,
+          {
+            id     => $id,
+            status => $status,
+            stdout => $stdout,
+            stderr => $stderr
+          };
+    }
+
+    die "corrupt snapshot (trailing data)\n" if $off != length $bytes;
+    return \@records;
+}
+
+# ============================================================
+# 9. COMPARISON PIPELINE (pure, except for the injected runner)
+# ============================================================
+
+sub compare_records {
+    my ( $want, $got, $compare ) = @_;
+    $compare //= $strict_compare;
+    my @diffs = $compare->( $want, $got );
+    return {
+        id    => $want->{id},
+        state => ( @diffs ? 'fail' : 'pass' ),
+        diffs => \@diffs,
+        want  => $want,
+        got   => $got,
+    };
+}
+
+sub compare_tests {
+    my ( $runner, $want, $test, $global_norm, $registry ) = @_;
+    return { id => $test->{id}, state => 'new' } unless $want;
+
+    my $names = [ @$global_norm, @{ $test->{normalize} } ];
+    my $got   = $runner->($test);
+    my $res   = compare_records(
+        normalize_record( $names, $want, $registry ),
+        normalize_record( $names, $got,  $registry )
+    );
+    $res->{timed_out} = $got->{timed_out};
+    return $res;
+}
+
+sub replay_tests {
+    my ( $runner, $tests, $snapshot, $global_norm, $registry ) = @_;
+    my %want = map { ( $_->{id}, $_ ) } @$snapshot;
+    return map {
+        compare_tests( $runner, $want{ $_->{id} }, $_, $global_norm, $registry )
+    } @$tests;
+}
+
+sub find_stale {
+    my ( $tests, $snapshot ) = @_;
+    my %have = map { ( $_->{id}, 1 ) } @$tests;
+    return map { +{ id => $_->{id}, state => 'stale' } }
+      grep { !$have{ $_->{id} } } @$snapshot;
+}
+
+# ============================================================
+# 10. REPORTING PIPELINE (pure)
+# ============================================================
+
+sub describe_status {
+    my ($s) = @_;
+    return 'failed to run' if $s < 0;
+    return 'exit ' . ( $s >> 8 ) unless $s & 127;
+    return sprintf( 'killed by signal %d%s',
+        $s & 127, ( $s & 128 ) ? ' (core dumped)' : '' );
+}
+
+# text = no control bytes (except \t \n \r etc.) and valid UTF-8
+sub is_text {
+    my ($bytes) = @_;
+    return 0 if $bytes =~ /[\x00-\x08\x0e-\x1a\x1c-\x1f]/;
+    my $copy = $bytes;
+    return utf8::decode($copy) ? 1 : 0;
+}
+
+sub show_line {
+    my ($s) = @_;
+    $s =~ s/([\x00-\x08\x0b-\x1f\x7f])/sprintf('\\x%02x', ord($1))/ge;
+    $s = substr( $s, 0, 197 ) . '...' if length($s) > 200;
+    return $s;
+}
+
+sub first_diff_offset {
+    my ( $x, $y ) = @_;
+    my $n   = length($x) < length($y) ? length($x) : length($y);
+    my $xor = substr( $x, 0, $n ) ^ substr( $y, 0, $n );
+    $xor =~ /\A\0*/;
+    return $+[0];
+}
+
+sub numbered {
+    my ( $prefix, $lines, $from, $count ) = @_;
+    return ()                                               if $count <= 0;
+    return sprintf( "      %s (end of output)\n", $prefix ) if $from > $#$lines;
+    my $to = $from + $count - 1;
+    $to = $#$lines if $to > $#$lines;
+    return map {
+        sprintf( "      %s %4d | %s\n",
+            $prefix, $_ + 1, show_line( $lines->[$_] ) )
+    } $from .. $to;
+}
+
+sub text_diff {
+    my ( $want, $got ) = @_;
+    ( my $w0 = $want ) =~ s/\n\z//;
+    ( my $g0 = $got )  =~ s/\n\z//;
+    return "      differs only in the trailing newline\n" if $w0 eq $g0;
+    my @w = split /\n/, $w0, -1;
+    my @g = split /\n/, $g0, -1;
+
+    my $i = 0;
+    $i++ while $i < @w && $i < @g && $w[$i] eq $g[$i];
+
+    my $from = $i > 2 ? $i - 2 : 0;
+    return join '',
+      sprintf(
+        "      first difference at line %d (expected %d bytes, got %d)\n",
+        $i + 1, length($want), length($got)
+      ),
+      numbered( ' ', \@w, $from, $i - $from ),
+      numbered( '-', \@w, $i,    3 ),
+      numbered( '+', \@g, $i,    3 );
+}
+
+sub hex_line {
+    my ( $bytes, $start ) = @_;
+    my $chunk = substr( $bytes, $start, 16 );
+    return '(end of data)' unless length $chunk;
+    my $hex = join ' ', map { sprintf( '%02x', ord($_) ) } split //, $chunk;
+    ( my $asc = $chunk ) =~ tr/\x20-\x7e/./c;
+    return sprintf( '%08x: %-47s |%s|', $start, $hex, $asc );
+}
+
+sub hex_diff {
+    my ( $want, $got ) = @_;
+    my $off   = first_diff_offset( $want, $got );
+    my $start = $off - ( $off % 16 );
+    return join '',
+      sprintf(
+"      first difference at byte offset %d (0x%x); expected %d bytes, got %d\n",
+        $off, $off, length($want), length($got) ),
+      '      - ' . hex_line( $want, $start ) . "\n",
+      '      + ' . hex_line( $got,  $start ) . "\n";
+}
+
+sub format_diff {
+    my ( $field, $want, $got ) = @_;
+    if ( $field eq 'status' ) {
+        return sprintf(
+            "      status: expected %s, got %s\n",
+            describe_status( $want->{status} ),
+            describe_status( $got->{status} )
+        );
+    }
+    my ( $w, $g ) = ( $want->{$field}, $got->{$field} );
+    return "      $field differs\n"
+      . (    is_text($w)
+          && is_text($g) ? text_diff( $w, $g ) : hex_diff( $w, $g ) );
+}
+
+sub format_result {
+    my ( $r, $quiet ) = @_;
+    my $s = $r->{state};
+
+    return ( $quiet ? '' : "PASS  $r->{id}\n" )                 if $s eq 'pass';
+    return "NEW   $r->{id}  (no snapshot; run `grrr record`)\n" if $s eq 'new';
+    return "STALE $r->{id}  (in snapshot, no longer in the test list)\n"
+      if $s eq 'stale';
+
+    return
+        "FAIL  $r->{id}\n"
+      . ( $r->{timed_out} ? "      timed out and was killed\n" : '' )
+      . join( '',
+        map { format_diff( $_, $r->{want}, $r->{got} ) } @{ $r->{diffs} } );
+}
+
+sub summarize {
+    my ($results) = @_;
+    return foldl(
+        sub {
+            my ( $acc, $r ) = @_;
+            return { %$acc, $r->{state} => $acc->{ $r->{state} } + 1 };
+        },
+        { pass => 0, fail => 0, new => 0, stale => 0 },
+        $results
+    );
+}
+
+sub format_report {
+    my ( $results, $quiet ) = @_;
+    my $sum = summarize($results);
+    return join( '', map { format_result( $_, $quiet ) } @$results )
+      . sprintf( "\n%d passed, %d failed, %d new, %d stale\n",
+        @{$sum}{qw(pass fail new stale)} );
+}
+
+sub dump_stream {
+    my ($bytes) = @_;
+    if ( is_text($bytes) ) {
+        return join '', map { '        | ' . show_line($_) . "\n" } split /\n/,
+          $bytes;
+    }
+    return join '', map { '        ' . hex_line( $bytes, $_ * 16 ) . "\n" }
+      grep { $_ * 16 < length $bytes } 0 .. 3;
+}
+
+sub inspect_record {
+    my ( $r, $show ) = @_;
+    my $s = sprintf(
+        "  %s\n      %s, stdout %d B, stderr %d B\n",
+        $r->{id},
+        describe_status( $r->{status} ),
+        length( $r->{stdout} ),
+        length( $r->{stderr} )
+    );
+    return $s unless $show;
+    for my $f (qw(stdout stderr)) {
+        next unless length $r->{$f};
+        $s .= "      $f:\n" . dump_stream( $r->{$f} );
+    }
+    return $s;
+}
+
+sub format_inspect {
+    my ( $records, $path, $show ) = @_;
+    return
+      sprintf( "%s: %d record(s)\n", $path, scalar @$records )
+      . join( '', map { inspect_record( $_, $show ) } @$records );
+}
+
+sub format_recorded {
+    my ($r) = @_;
+    return sprintf(
+        "REC   %s  (%s, stdout %d B, stderr %d B)%s\n",
+        $r->{id},
+        describe_status( $r->{status} ),
+        length( $r->{stdout} ),
+        length( $r->{stderr} ),
+        $r->{timed_out} ? '  ** TIMED OUT **' : ''
+    );
+}
+
+# ============================================================
+# 11. APPLICATION COMMANDS
+#
+# Each command receives $io, the imperative boundary:
+# slurp(path) spew(path, bytes) exists(path) run(test, timeout) say(text)
+# so the whole record/replay flow can be driven with fakes.
+# ============================================================
+
+sub cmd_record {
+    my ( $io, $o ) = @_;
+
+    my $tests    = load_tests( $io, $o );
+    my @selected = select_tests( $tests, $o->{pattern} );
+    my $old =
+      $io->{exists}->( $o->{snapshot} )
+      ? deserialize_results( $io->{slurp}->( $o->{snapshot} ) )
+      : [];
+
+    my $runner = make_runner( $io->{run}, $o->{timeout} );
+    my @fresh;
+    for my $test (@selected) {
+        my $r = $runner->($test);
+        $io->{say}->( format_recorded($r) );
+        push @fresh, $r;
+    }
+
+    my $merged = merge_snapshot( $tests, $old, \@fresh );
+    $io->{spew}->( $o->{snapshot}, serialize_results($merged) );
+    $io->{say}->(
+        sprintf(
+            "recorded %d test(s), snapshot has %d: %s\n",
+            scalar @fresh,
+            scalar @$merged,
+            $o->{snapshot}
+        )
+    );
+    return EXIT_SUCCESS;
+}
+
+sub cmd_replay {
+    my ( $io, $o ) = @_;
+
+    my $tests = load_tests( $io, $o );
+    die "no snapshot '$o->{snapshot}'; run `grrr record` first\n"
+      unless $io->{exists}->( $o->{snapshot} );
+
+    my $snapshot = deserialize_results( $io->{slurp}->( $o->{snapshot} ) );
+    my @selected = select_tests( $tests, $o->{pattern} );
+    my $runner   = make_runner( $io->{run}, $o->{timeout} );
+
+    my @results = (
+        replay_tests(
+            $runner, \@selected, $snapshot, $o->{normalize}, $o->{registry}
+        ),
+        ( defined $o->{pattern} ? () : find_stale( $tests, $snapshot ) ),
+    );
+
+    $io->{say}->("grrr replay: $o->{file} (snapshot $o->{snapshot})\n");
+    $io->{say}->( format_report( \@results, $o->{quiet} ) );
+
+    my $sum = summarize( \@results );
+    if ( $sum->{pass} + $sum->{fail} == 0 && $sum->{new} && $sum->{stale} ) {
+        $io->{say}->(
+"hint: no test in $o->{file} matches any record in $o->{snapshot}.\n"
+              . "      -s only selects the snapshot; use -f to select the list it was recorded from.\n"
+        );
+    }
+    return ( $sum->{fail} || $sum->{new} ) ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+sub cmd_inspect {
+    my ( $io, $o ) = @_;
+    die "no snapshot '$o->{snapshot}'\n"
+      unless $io->{exists}->( $o->{snapshot} );
+    my $snapshot = deserialize_results( $io->{slurp}->( $o->{snapshot} ) );
+    my @records  = filter_by_id( $snapshot, $o->{pattern} );
+    $io->{say}->( format_inspect( \@records, $o->{snapshot}, $o->{show} ) );
+    return EXIT_SUCCESS;
+}
+
+# ---- selftest -------------------------------------------------
+
+sub make_fake_io {
+    my ( $files, $run, $out_ref ) = @_;
+    return {
+        slurp => sub {
+            exists $files->{ $_[0] } or die "no such file: $_[0]\n";
+            $files->{ $_[0] };
+        },
+        spew   => sub { $files->{ $_[0] } = $_[1]; 1 },
+        exists => sub { exists $files->{ $_[0] } ? 1 : 0 },
+        run    => $run,
+        say    => sub { $$out_ref .= join '', @_ },
+    };
+}
+
+sub cmd_selftest {
+    my ( $io, $o )      = @_;
+    my ( $n,  $failed ) = ( 0, 0 );
+
+    my $ok = sub {
+        my ( $cond, $name ) = @_;
+        $n++;
+        $failed++ unless $cond;
+        print +( $cond ? 'ok' : 'not ok' ), " $n - $name\n";
+        return $cond;
+    };
+    my $dies = sub {
+        my ($code) = @_;
+        return eval { $code->(); 1 } ? '' : $@;
+    };
+
+    # --- functional utilities
+    $ok->( foldl( sub { $_[0] + $_[1] }, 0, [ 1 .. 4 ] ) == 10, 'foldl sums' );
+    $ok->(
+        foldr( sub { $_[0] . $_[1] }, '', [qw(a b c)] ) eq 'abc',
+        'foldr order'
+    );
+    $ok->(
+        compose( sub { $_[0] + 1 }, sub { $_[0] * 2 } )->(3) == 8,
+        'compose runs left to right'
+    );
+    $ok->(
+        compose()->(7) == 7 && compose() == \&identity,
+        'empty compose is identity'
+    );
+    my $inc = sub { $_[0] + 1 };
+    $ok->(
+        compose( \&identity, $inc )->(3) == 4
+          && compose( $inc, \&identity )->(3) == 4,
+        'identity is the unit of compose'
+    );
+    $ok->( compose( $inc, $inc, $inc )->(0) == 3,
+        'compose chains three steps' );
+
+    # --- parsing
+    my $t = parse_tests(
+"# c\n\n\@name greet\n\@timeout 2\n\@normalize crlf,timestamp\necho hi\nls /\n"
+    );
+    $ok->( @$t == 2, 'parse: two tests' );
+    $ok->( $t->[0]{id} eq 'greet' && $t->[0]{cmd} eq 'echo hi',
+        'parse: @name' );
+    $ok->(
+        $t->[0]{timeout} == 2 && "@{$t->[0]{normalize}}" eq 'crlf timestamp',
+        'parse: directives'
+    );
+    $ok->(
+        $t->[1]{id} eq 'ls /' && !@{ $t->[1]{normalize} },
+        'parse: defaults'
+    );
+    $ok->(
+        $dies->( sub { parse_tests("echo a\necho a\n") } ) =~ /duplicate/,
+        'parse: duplicate id'
+    );
+    $ok->(
+        $dies->( sub { parse_tests("\@name x\n") } ) =~ /dangling/,
+        'parse: dangling directive'
+    );
+    $ok->(
+        $dies->( sub { parse_tests("\@bogus 1\necho a\n") } ) =~
+          /unknown directive/,
+        'parse: unknown directive'
+    );
+    $ok->(
+        $dies->( sub { parse_tests("\@normalize nope\necho a\n") } ) =~
+          /unknown normalizer/,
+        'parse: unknown normalizer'
+    );
+
+    # --- serialization (binary safe)
+    my $recs = [
+        { id => 'a', status => 0,   stdout => "\0\1\xff\n", stderr => '' },
+        { id => 'b', status => 256, stdout => '',           stderr => "e\r\n" },
+        { id => 'c', status => 9,   stdout => ( 'x' x 70000 ), stderr => "\0" },
+    ];
+    my $bytes = serialize_results($recs);
+    my $back  = deserialize_results($bytes);
+    $ok->(
+        @$back == 3 && $back->[0]{stdout} eq "\0\1\xff\n",
+        'roundtrip: binary stdout'
+    );
+    $ok->(
+        $back->[1]{status} == 256 && $back->[1]{stderr} eq "e\r\n",
+        'roundtrip: status and stderr'
+    );
+    $ok->( length( $back->[2]{stdout} ) == 70000, 'roundtrip: large chunk' );
+    $ok->( serialize_results($back) eq $bytes,    'roundtrip: stable bytes' );
+    $ok->(
+        $dies->( sub { deserialize_results('hello world') } ) =~
+          /not a grrr snapshot/,
+        'decode: bad magic'
+    );
+    $ok->(
+        $dies->(
+            sub {
+                deserialize_results( substr( $bytes, 0, length($bytes) - 3 ) );
+            }
+        ) =~ /truncated/,
+        'decode: truncated'
+    );
+    $ok->(
+        $dies->( sub { deserialize_results( $bytes . 'x' ) } ) =~ /trailing/,
+        'decode: trailing data'
+    );
+
+    # --- normalization
+    my $nr = normalize_record(
+        [ 'crlf', 'timestamp', 'address' ],
+        {
+            id     => 'x',
+            status => 0,
+            stdout => "t=2026-11-06T10:11:12Z p=0xdeadbeef\r\n",
+            stderr => '',
+        }
+    );
+    $ok->(
+        $nr->{stdout} eq "t=<TIMESTAMP> p=0xADDR\n",
+        'normalize: crlf, timestamp, address'
+    );
+
+    # --- comparison and diffs
+    my $base = { id => 'x', status => 0, stdout => "a\nb\nc\n", stderr => '' };
+    $ok->(
+        compare_records( $base, {%$base} )->{state} eq 'pass',
+        'compare: equal passes'
+    );
+    $ok->(
+        "@{ compare_records($base, { %$base, status => 256 })->{diffs} }" eq
+          'status',
+        'compare: status differs'
+    );
+    my $bad = { %$base, stdout => "a\nX\nc\n" };
+    $ok->(
+        format_diff( 'stdout', $base, $bad ) =~ /first difference at line 2/,
+        'diff: text line number'
+    );
+    $ok->(
+        format_diff( 'stdout', { stdout => "AB\0D" }, { stdout => "AB\0E" } )
+          =~ /byte offset 3/,
+        'diff: binary offset'
+    );
+    $ok->(
+        describe_status(256) eq 'exit 1' && describe_status(9) =~ /signal 9/,
+        'status decoding'
+    );
+    $ok->(
+        is_text("plain\r\n\ttext") && is_text("h\xc3\xa9llo"),
+        'is_text: ascii and utf-8'
+    );
+    $ok->(
+        !is_text("a\0b") && !is_text("\xff\xfe\xfd"),
+        'is_text: NUL and invalid utf-8 are binary'
+    );
+
+    # --- whole pipeline with a fake runner and in-memory files
+    my %files = ( 'tests.list' => "echo one\necho two\n" );
+    my $out   = '';
+    my $mode  = 'a';
+    my $fake  = sub {
+        my ($test) = @_;
+        my $tag =
+          ( $mode eq 'b' && $test->{cmd} eq 'echo two' ) ? 'CHANGED' : 'out';
+        return {
+            id        => $test->{id},
+            status    => 0,
+            stdout    => "$tag:$test->{cmd}\n",
+            stderr    => '',
+            timed_out => 0
+        };
+    };
+    my $fio = make_fake_io( \%files, $fake, \$out );
+    my %opt = (
+        file      => 'tests.list',
+        snapshot  => 'tests.list.bi',
+        timeout   => 5,
+        normalize => [],
+        quiet     => 0,
+        show      => 0,
+        pattern   => undef
+    );
+
+    $ok->(
+        cmd_record( $fio, \%opt ) == EXIT_SUCCESS
+          && exists $files{'tests.list.bi'},
+        'pipeline: record writes snapshot'
+    );
+    $out = '';
+    $ok->(
+        cmd_replay( $fio, \%opt ) == EXIT_SUCCESS
+          && $out =~ /2 passed, 0 failed/,
+        'pipeline: replay passes'
+    );
+    $mode = 'b';
+    $out  = '';
+    $ok->(
+        cmd_replay( $fio, \%opt ) == EXIT_FAILURE
+          && $out =~ /FAIL  echo two/
+          && $out =~ /first difference at line 1/,
+        'pipeline: mismatch is reported'
+    );
+    $out = '';
+    $ok->(
+        cmd_replay( $fio, { %opt, pattern => 'one' } ) == EXIT_SUCCESS,
+        'pipeline: pattern runs a subset'
+    );
+    $ok->(
+        cmd_record( $fio, { %opt, pattern => 'two' } ) == EXIT_SUCCESS,
+        'pipeline: partial re-record'
+    );
+    $out = '';
+    $ok->(
+        cmd_replay( $fio, \%opt ) == EXIT_SUCCESS,
+        'pipeline: passes after re-record'
+    );
+    $files{'tests.list'} .= "echo three\n";
+    $out = '';
+    $ok->(
+        cmd_replay( $fio, \%opt ) == EXIT_FAILURE && $out =~ /NEW   echo three/,
+        'pipeline: new test flagged'
+    );
+    $files{'tests.list'} = "echo one\n";
+    $out = '';
+    $ok->(
+        cmd_replay( $fio, \%opt ) == EXIT_SUCCESS
+          && $out =~ /STALE echo two/
+          && $out =~ /1 stale/,
+        'pipeline: stale snapshot flagged'
+    );
+    $out = '';
+    $ok->(
+        cmd_inspect( $fio, { %opt, show => 1 } ) == EXIT_SUCCESS
+          && $out =~ /out:echo one/,
+        'pipeline: inspect --show'
+    );
+
+    # --- plugins (runtime normalizers)
+    my $pdir = "/tmp/grrr-selftest-plugin.$$";
+    mkdir $pdir or die "cannot create $pdir: $!\n";
+    my %pf = (
+        good =>
+'return { "strip-ansi" => sub { (my $s = $_[0]) =~ s/\e\[[0-9;]*m//g; $s }, upper => sub { uc $_[0] } };'
+          . "\n",
+        clash    => 'return { crlf => sub { $_[0] } };' . "\n",
+        notahash => 'return [1];' . "\n",
+        notcode  => 'return { x => 1 };' . "\n",
+        impure => 'my $n = 0; return { flaky => sub { $n++ . $_[0] } };' . "\n",
+        badname => 'return { "a b" => sub { $_[0] } };' . "\n",
+        broken  => 'return {{{;' . "\n",
+    );
+    spew_atomic( "$pdir/$_.pl", $pf{$_} ) for keys %pf;
+
+    my $reg = load_plugins( \%NORMALIZERS, "$pdir/good.pl" );
+    $ok->(
+        $reg->{upper} && $reg->{'strip-ansi'} && $reg->{crlf},
+        'plugin: added to the registry, built-ins kept'
+    );
+    $ok->(
+        !exists $NORMALIZERS{upper},
+        'plugin: built-in registry is not modified'
+    );
+    $ok->(
+        normalize_record(
+            [ 'strip-ansi', 'upper' ],
+            {
+                id     => 'x',
+                status => 0,
+                stdout => "\e[31mred\e[0m",
+                stderr => ''
+            },
+            $reg
+        )->{stdout} eq 'RED',
+        'plugin: normalizers compose'
+    );
+    $ok->(
+        parse_tests( "\@normalize strip-ansi\necho a\n", $reg )
+          ->[0]{normalize}[0] eq 'strip-ansi',
+        'plugin: usable in @normalize'
+    );
+    $ok->(
+        $dies->( sub { parse_tests("\@normalize strip-ansi\necho a\n") } ) =~
+          /unknown normalizer/,
+        'plugin: unknown without the plugin loaded'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/clash.pl" ) } ) =~
+          /already defined/,
+        'plugin: cannot redefine a built-in'
+    );
+    $ok->(
+        $dies->(
+            sub {
+                load_plugins( \%NORMALIZERS, "$pdir/good.pl", "$pdir/good.pl" );
+            }
+        ) =~ /already defined/,
+        'plugin: cannot define a name twice'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/notahash.pl" ) } )
+          =~ /hash reference/,
+        'plugin: must return a hash'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/notcode.pl" ) } ) =~
+          /not a code reference/,
+        'plugin: values must be code'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/impure.pl" ) } ) =~
+          /not pure/,
+        'plugin: impure normalizer is rejected'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/badname.pl" ) } ) =~
+          /bad normalizer name/,
+        'plugin: bad name is rejected'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/broken.pl" ) } ) =~
+          /plugin/,
+        'plugin: syntax error is reported'
+    );
+    $ok->(
+        $dies->( sub { load_plugins( \%NORMALIZERS, "$pdir/missing.pl" ) } ) =~
+          /no such file/,
+        'plugin: missing file is reported'
+    );
+
+    my $pa =
+      parse_arguments( '--plugin', "$pdir/good.pl", '-n', 'upper', 'replay' );
+    $ok->(
+        $pa->{registry}{upper} && "@{$pa->{normalize}}" eq 'upper',
+        'plugin: --plugin and --normalize together'
+    );
+    $ok->(
+        $dies->( sub { parse_arguments( '-n', 'upper', 'replay' ) } ) =~
+          /unknown normalizer/,
+        'plugin: --normalize needs the plugin'
+    );
+
+    my %pfiles = ( 'p.list' => "\@normalize strip-ansi\necho colored\n" );
+    my $pcode  = '1';
+    my $prun   = sub {
+        my ($t) = @_;
+        return {
+            id        => $t->{id},
+            status    => 0,
+            stdout    => "\e[${pcode}mcolor\e[0m\n",
+            stderr    => '',
+            timed_out => 0
+        };
+    };
+    my $pout = '';
+    my $pio  = make_fake_io( \%pfiles, $prun, \$pout );
+    my %popt =
+      ( %opt, file => 'p.list', snapshot => 'p.list.bi', registry => $reg );
+    cmd_record( $pio, \%popt );
+    $pcode = '32';    # the colour code changes between record and replay
+    $ok->(
+        cmd_replay( $pio, \%popt ) == EXIT_SUCCESS,
+        'plugin: pipeline passes thanks to the normalizer'
+    );
+    $ok->(
+        $dies->( sub { cmd_replay( $pio, { %popt, registry => undef } ) } ) =~
+          /unknown normalizer/,
+        'plugin: pipeline refuses the list without the plugin'
+    );
+    unlink glob("$pdir/*.pl");
+    rmdir $pdir;
+
+    # --- real processes
+    my $r = run_command(
+        { id => 't', cmd => q{printf 'a\000b'; echo err >&2; exit 3} }, 5 );
+    $ok->(
+        $r->{stdout} eq "a\0b"
+          && $r->{stderr} eq "err\n"
+          && ( $r->{status} >> 8 ) == 3,
+        'real: bytes, streams, exit code'
+    );
+
+    my $t0 = time;
+    $r = run_command( { id => 's', cmd => 'sleep 5; echo late' }, 0.5 );
+    $ok->(
+        $r->{timed_out} && ( $r->{status} & 127 ) == 9 && time - $t0 < 3,
+        'real: timeout kills the tree'
+    );
+
+    $r = run_command(
+        {
+            id  => 'big',
+            cmd => 'head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2'
+        },
+        10
+    );
+    $ok->(
+        length( $r->{stdout} ) == 300000 && length( $r->{stderr} ) == 300000,
+        'real: big stdout+stderr, no deadlock'
+    );
+
+    my $tmp = "/tmp/grrr-selftest.$$";
+    spew_atomic( $tmp, "from stdin\n" );
+    $r = run_command( { id => 'in', cmd => 'cat', stdin => $tmp }, 5 );
+    unlink $tmp;
+    $ok->( $r->{stdout} eq "from stdin\n", 'real: @stdin file' );
+
+    $r = run_command( { id => 'nostdin', cmd => 'cat' }, 5 );
+    $ok->(
+        $r->{stdout} eq '' && $r->{status} == 0,
+        'real: default stdin is /dev/null'
+    );
+
+    print "# $n tests, $failed failed\n";
+    return $failed ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+# ============================================================
+# 12. COMMAND LINE ARGUMENTS
+# ============================================================
+
+my $REAL_IO = {
+    slurp  => \&slurp,
+    spew   => \&spew_atomic,
+    exists => sub { -e $_[0] ? 1 : 0 },
+    run    => \&run_command,
+    say    => sub { print @_ },
+};
+
+my %COMMANDS = (
+    record   => \&cmd_record,
+    replay   => \&cmd_replay,
+    inspect  => \&cmd_inspect,
+    selftest => \&cmd_selftest,
+    help     => sub { print_help() },
+    version  => sub { print_version() },
+);
+
+sub parse_arguments {
+    my (@argv) = @_;
+    my %o = (
+        file      => 'tests.list',
+        timeout   => 10,
+        normalize => [],
+        quiet     => 0,
+        show      => 0
+    );
+    my ( $help, $version, @plugins );
+
+    GetOptionsFromArray(
+        \@argv,
+        'file|f=s'      => \$o{file},
+        'snapshot|s=s'  => \$o{snapshot},
+        'timeout|t=f'   => \$o{timeout},
+        'normalize|n=s' =>
+          sub { push @{ $o{normalize} }, split /\s*,\s*/, $_[1] },
+        'plugin|p=s' => \@plugins,
+        'quiet|q'    => \$o{quiet},
+        'show'       => \$o{show},
+        'help|h'     => \$help,
+        'version|V'  => \$version,
+    ) or die usage();
+
+    my $command =
+      $help ? 'help' : $version ? 'version' : ( shift(@argv) // 'help' );
+    my $pattern = shift @argv;
+    die "too many arguments\n" . usage() if @argv;
+    die "timeout must be positive\n" unless $o{timeout} > 0;
+
+    $o{registry} = load_plugins( \%NORMALIZERS, @plugins );
+
+    my @bad = grep { !$o{registry}{$_} } @{ $o{normalize} };
+    die 'unknown normalizer(s): ' . join( ', ', @bad ) . "\n" if @bad;
+
+    $o{snapshot} //= "$o{file}.bi";
+    return { %o, command => $command, pattern => $pattern };
+}
+
+sub dispatch_command {
+    my ($o) = @_;
+    my $fn = $COMMANDS{ $o->{command} }
+      or die "unknown command '$o->{command}'\n" . usage();
+    return $fn->( $REAL_IO, $o );
+}
+
+# ============================================================
+# 13. MAIN
+# ============================================================
+
+sub main {
+    my (@argv) = @_;
+
+    my $cleanup = sub {
+        kill_tree($running_pid) if $running_pid;
+        exit 130;
+    };
+    local $SIG{INT}  = $cleanup;
+    local $SIG{TERM} = $cleanup;
+
+    my $code = eval { dispatch_command( parse_arguments(@argv) ) };
+    if ( !defined $code ) {
+        print STDERR "grrr: $@";
+        return EXIT_ERROR;
+    }
+    return $code;
+}
+
+exit main(@ARGV);

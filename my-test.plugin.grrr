@@ -1,0 +1,3 @@
+return {
+	'epoch' => sub { (my $s = $_[0]) =~ s/[0-9]+/<EPOCH>/g; return $s},
+};

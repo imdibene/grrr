@@ -1,0 +1,142 @@
+# ============================================================
+# grrr tests.list — example test suite
+#
+# Format: one shell command per line. Directives (@name, @stdin,
+# @timeout, @normalize) apply to the next command line.
+# Commands run via /bin/sh -c in the current directory.
+# ============================================================
+
+# --- basic text output ---------------------------------------
+
+@name hello
+echo Hello, World!
+
+@name multi-line
+printf 'line one\nline two\nline three\n'
+
+@name empty-output
+true
+
+# --- exit codes ----------------------------------------------
+
+@name exit-zero
+sh -c 'exit 0'
+
+@name exit-one
+sh -c 'exit 1'
+
+@name exit-127
+sh -c 'exit 127'
+
+# --- stderr handling -----------------------------------------
+
+@name stderr-only
+sh -c 'echo "this is an error" >&2'
+
+@name both-streams
+sh -c 'echo out; echo err >&2'
+
+# --- binary safety -------------------------------------------
+# NUL bytes, high bytes, no newline at end.  This is the case
+# that would break backticks/qx// but works with IO::Select.
+
+@name binary-nul
+printf 'a\000b\000c'
+
+@name binary-high-bytes
+printf '\377\376\375\374'
+
+@name binary-mixed
+printf 'start\000\001\002end'
+
+# --- stdin injection -----------------------------------------
+# Create the input file first:
+#   echo "piped input" > /tmp/grrr-stdin.txt
+#   printf '\000\001\002\377' > /tmp/grrr-stdin-bin.txt
+
+@name stdin-text
+@stdin /tmp/grrr-stdin.txt
+cat
+
+@name stdin-binary
+@stdin /tmp/grrr-stdin-bin.txt
+cat
+
+# --- normalization (nondeterministic output) -----------------
+# These commands produce output that changes between runs.
+# The normalizers make the snapshot stable.
+
+@name timestamp-stable
+@normalize timestamp
+echo "started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+@name pid-stripped
+@normalize address
+sh -c 'echo "pid=$$" | sed "s/pid=[0-9]*/pid=0xdeadbeef/"'
+
+@name crlf-normalized
+@normalize crlf
+printf 'line one\r\nline two\r\n'
+
+@name trailing-ws
+@normalize trailing-ws
+printf 'padded   \nlines\t\t\n'
+
+@name multiple-normalizers
+@normalize crlf,trailing-ws
+printf 'line with trailing   \r\n'
+
+# --- plugin --------------------------------------------------
+## uncomment to test the plugin the
+# ./grrr record -f tests.list -p my-test.plugin.grrr
+# ./grrr replay -p my-test.plugin.grrr
+##@name dummy-plugin
+##@normalize epoch
+##date +%s
+
+# --- large output (no deadlock test) -------------------------
+
+@name big-stdout
+head -c 500000 /dev/zero
+
+@name big-stderr
+@normalize address
+head -c 500000 /dev/zero >&2
+
+@name big-both
+head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2
+
+# --- timeout ------------------------------------------------
+# Should be killed after @timeout seconds.  On replay this
+# will show "timed out and was killed" if it changes.
+
+@name timeout-short
+@timeout 1
+sleep 30
+
+# --- pipes and redirections ----------------------------------
+
+@name pipeline
+printf 'c\nb\na\n' | sort
+
+@name redirection
+sh -c 'echo redirected > /tmp/grrr-redirect-test.txt; cat /tmp/grrr-redirect-test.txt'
+
+@name subshell
+sh -c '(echo inner; echo outer) | tr a-z A-Z'
+
+# --- working directory behavior ------------------------------
+
+@name pwd-is-cwd
+pwd | sed 's|.*/||'
+
+@name relative-path
+ls -1 2>/dev/null | head -3 || true
+
+# --- environment variables -----------------------------------
+
+@name env-var
+grrr_TEST_VAR=hello sh -c 'echo "value=$grrr_TEST_VAR"'
+
+@name env-var-unset
+sh -c 'echo "value=${grrr_TEST_VAR:-unset}"'
