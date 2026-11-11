@@ -61,7 +61,7 @@ Use `grrr` when you want golden-file regression tests for a command-line program
 Copy it anywhere on your `PATH`
 
 ```sh
-$ curl -fsSL https://raw.githubusercontent.com/YOU/grrr/main/grrr -o ~/bin/grrr
+$ curl -fsSL https://raw.githubusercontent.com/imdibene/grrr/refs/heads/main/grrr
 $ chmod +x ~/bin/grrr
 ```
 
@@ -599,7 +599,7 @@ Yes, it's a single file with no dependencies:
 # .github/workflows/test.yml
 - name: Install grrr
   run: |
-    curl -fsSL https://raw.githubusercontent.com/YOU/grrr/main/grrr -o /usr/local/bin/grrr
+    curl -fsSL https://raw.githubusercontent.com/imdibene/grrr/refs/heads/main/grrr
     chmod +x /usr/local/bin/grrr
 
 - name: Replay
